@@ -1,0 +1,145 @@
+// CI pipeline for cicd-app.
+// Jenkins job: "Pipeline script from SCM", Script Path = devops/Jenkinsfile
+// Flow: test -> SonarQube -> quality gate -> build -> Trivy -> push to ECR -> update deployment repo
+// Deployment itself is done by Argo CD, which watches the deployment repo.
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    triggers {
+        pollSCM('H/2 * * * *')   // check GitHub every ~2 minutes
+    }
+
+    environment {
+        AWS_REGION     = 'ap-south-1'
+        AWS_ACCOUNT_ID = '718460151470'
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPO       = "${ECR_REGISTRY}/cicd-app"
+        DEPLOY_REPO    = 'github.com/aravindrajsaravanan/cicdpipeline_deployment.git'
+        DEPLOY_BRANCH  = 'main'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    def sha = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${sha}"
+                    echo "Image tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Lint & Test') {
+            steps {
+                sh '''
+                    python3 -m venv .venv
+                    . .venv/bin/activate
+                    pip install -q -r requirements.txt -r requirements-dev.txt
+                    ruff check .
+                    pytest --cov=. --cov-report=xml --junitxml=test-results.xml
+                '''
+            }
+            post {
+                always { junit allowEmptyResults: true, testResults: 'test-results.xml' }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonarqube') {
+                    sh 'sonar-scanner -Dproject.settings=devops/sonar-project.properties'
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    docker build -f devops/Dockerfile \
+                      --label org.opencontainers.image.revision=$(git rev-parse HEAD) \
+                      --label org.opencontainers.image.version=$IMAGE_TAG \
+                      -t $ECR_REPO:$IMAGE_TAG .
+                '''
+            }
+        }
+
+        stage('Trivy Scan') {
+            steps {
+                // Fail the build on fixable HIGH/CRITICAL vulnerabilities
+                sh '''
+                    trivy image --no-progress --ignore-unfixed \
+                      --severity HIGH,CRITICAL --exit-code 1 \
+                      $ECR_REPO:$IMAGE_TAG
+                '''
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                // Uses the EC2 instance role - no AWS keys stored in Jenkins
+                sh '''
+                    aws ecr get-login-password --region $AWS_REGION \
+                      | docker login --username AWS --password-stdin $ECR_REGISTRY
+                    docker push $ECR_REPO:$IMAGE_TAG
+                '''
+            }
+        }
+
+        stage('Update Deployment Repo') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'github-deploy-token',
+                                                  usernameVariable: 'GIT_USER',
+                                                  passwordVariable: 'GIT_TOKEN')]) {
+                    sh '''
+                        # Pass the token through a credential helper so it never lands in .git/config or the log
+                        GIT_AUTH='!f() { echo "username=$GIT_USER"; echo "password=$GIT_TOKEN"; }; f'
+
+                        rm -rf deploy-repo
+                        git -c credential.helper="$GIT_AUTH" clone --depth 1 -b $DEPLOY_BRANCH https://$DEPLOY_REPO deploy-repo
+                        cd deploy-repo/k8s
+
+                        sed -i "s#^\\(\\s*newTag:\\).*#\\1 $IMAGE_TAG#" kustomization.yaml
+                        grep -A2 'name: cicd-app' kustomization.yaml
+
+                        git config user.name  "Jenkins"
+                        git config user.email "jenkins@cicd.local"
+                        git add kustomization.yaml
+                        if git diff --cached --quiet; then
+                            echo "Image tag unchanged - nothing to commit"
+                            exit 0
+                        fi
+                        git commit -m "cicd-app: deploy $IMAGE_TAG [skip ci]"
+                        git -c credential.helper="$GIT_AUTH" push origin $DEPLOY_BRANCH
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pushed ${env.ECR_REPO}:${env.IMAGE_TAG} - Argo CD will sync it to EKS within ~3 minutes."
+        }
+        always {
+            sh 'docker image rm $ECR_REPO:$IMAGE_TAG || true'
+            deleteDir()
+        }
+    }
+}
