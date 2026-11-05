@@ -50,6 +50,32 @@ resource "aws_iam_role_policy" "jenkins_ecr_push" {
   policy = data.aws_iam_policy_document.jenkins_ecr_push.json
 }
 
+# Parameter Store: read the GitHub token, read/write the generated admin passwords. /cicd/* only.
+data "aws_iam_policy_document" "jenkins_params" {
+  statement {
+    sid       = "ReadProjectParams"
+    actions   = ["ssm:GetParameter", "ssm:GetParameters"]
+    resources = ["arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project}/*"]
+  }
+
+  statement {
+    sid     = "WriteGeneratedPasswords"
+    actions = ["ssm:PutParameter"]
+    resources = [
+      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project}/jenkins-admin-password",
+      "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project}/sonarqube-admin-password",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "jenkins_params" {
+  name   = "parameter-store-cicd"
+  role   = aws_iam_role.jenkins.id
+  policy = data.aws_iam_policy_document.jenkins_params.json
+}
+
+data "aws_caller_identity" "current" {}
+
 resource "aws_iam_instance_profile" "jenkins" {
   name = "${var.project}-jenkins-profile"
   role = aws_iam_role.jenkins.name
@@ -97,7 +123,12 @@ resource "aws_instance" "jenkins" {
   vpc_security_group_ids = [aws_security_group.jenkins.id]
   iam_instance_profile   = aws_iam_instance_profile.jenkins.name
 
-  user_data                   = file("${path.module}/../scripts/jenkins-setup.sh")
+  # JCasC file is injected base64-encoded so the script stays a plain bash file
+  user_data = replace(
+    file("${path.module}/../scripts/jenkins-setup.sh"),
+    "__CASC_B64__",
+    base64encode(file("${path.module}/../jenkins/casc.yaml"))
+  )
   user_data_replace_on_change = true
 
   metadata_options {
@@ -117,4 +148,7 @@ resource "aws_instance" "jenkins" {
   lifecycle {
     ignore_changes = [ami] # don't rebuild Jenkins every time Ubuntu publishes a new AMI
   }
+
+  # The setup script reads Parameter Store at boot, so the permission must exist first
+  depends_on = [aws_iam_role_policy.jenkins_params]
 }

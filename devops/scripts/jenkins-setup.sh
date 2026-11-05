@@ -6,8 +6,12 @@
 set -euxo pipefail
 exec > >(tee -a /var/log/jenkins-setup.log) 2>&1
 export DEBIAN_FRONTEND=noninteractive
+# On any failure, leave a marker with the failing line so it's visible immediately
+trap 'echo "FAILED at line $LINENO: $BASH_COMMAND" | tee /var/lib/cicd-setup-failed' ERR
 
 SONAR_SCANNER_VERSION="8.3.1.16491"
+PLUGIN_MANAGER_VERSION="2.16.0"
+JENKINS_PLUGINS="configuration-as-code job-dsl workflow-aggregator git sonar timestamper junit credentials-binding plain-credentials pipeline-stage-view"
 SONARQUBE_IMAGE="sonarqube:26.10.0.133078-community"
 POSTGRES_IMAGE="postgres:17.11-alpine"
 
@@ -29,6 +33,7 @@ echo "deb [signed-by=/etc/apt/keyrings/trivy.gpg] https://get.trivy.dev/deb gene
 
 apt-get update
 apt-get install -y jenkins trivy
+systemctl stop jenkins   # configured below, started at the end
 
 # ---------- Docker access for Jenkins ----------
 systemctl enable --now docker
@@ -82,6 +87,8 @@ services:
       SONAR_JDBC_URL: jdbc:postgresql://db:5432/sonar
       SONAR_JDBC_USERNAME: sonar
       SONAR_JDBC_PASSWORD: \${POSTGRES_PASSWORD}
+      # allow the webhook to Jenkins on the Docker host (172.17.0.1, a private address)
+      SONAR_VALIDATEWEBHOOKS: "false"
     ports:
       - "9000:9000"
     # lets the SonarQube webhook reach Jenkins on the host: http://host.docker.internal:8080
@@ -104,9 +111,122 @@ EOF
 
 docker compose --project-directory /opt/sonarqube --env-file /opt/sonarqube/.env up -d
 
-# ---------- start Jenkins (restart so the docker group applies) ----------
+# ---------- instance metadata (IMDSv2) ----------
+set +x   # keep the IMDS token out of the log
+IMDS_TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+imds() { curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
+REGION=$(imds placement/region)
+PUBLIC_IP=$(imds public-ipv4)
+
+# ======================================================================
+# Secrets section: xtrace OFF so no secret ever reaches the log.
+# Values live only in Parameter Store (/cicd/*) and root/jenkins-only files.
+# ======================================================================
+set +x
+get_param() { aws ssm get-parameter --region "$REGION" --name "$1" --with-decryption --query Parameter.Value --output text 2>/dev/null; }
+put_param() { aws ssm put-parameter --region "$REGION" --name "$1" --type SecureString --overwrite --value "$2" >/dev/null; }
+
+# ---------- SonarQube: admin password, analysis token, webhook ----------
+SONAR=http://localhost:9000
+echo "Waiting for SonarQube..."
+for _ in $(seq 1 90); do
+  [ "$(curl -s "$SONAR/api/system/status" | jq -r .status 2>/dev/null)" = "UP" ] && break
+  sleep 10
+done
+
+if curl -s -u admin:admin "$SONAR/api/authentication/validate" | jq -e '.valid' >/dev/null; then
+  echo "SonarQube: replacing default admin password"
+  SONAR_PW="Sq1!$(openssl rand -hex 16)"   # meets SonarQube complexity rules
+  curl -sf -u admin:admin -X POST "$SONAR/api/users/change_password" \
+    --data-urlencode login=admin --data-urlencode previousPassword=admin \
+    --data-urlencode "password=$SONAR_PW"
+  put_param /cicd/sonarqube-admin-password "$SONAR_PW"
+else
+  SONAR_PW=$(get_param /cicd/sonarqube-admin-password)
+fi
+
+curl -s -u "admin:$SONAR_PW" -X POST "$SONAR/api/user_tokens/revoke" --data-urlencode name=jenkins >/dev/null || true
+SONAR_TOKEN=$(curl -sf -u "admin:$SONAR_PW" -X POST "$SONAR/api/user_tokens/generate" \
+  --data-urlencode name=jenkins --data-urlencode type=GLOBAL_ANALYSIS_TOKEN | jq -r .token)
+echo "SonarQube: analysis token created"
+
+if ! curl -sf -u "admin:$SONAR_PW" "$SONAR/api/webhooks/list" | jq -e '.webhooks[] | select(.name=="jenkins")' >/dev/null; then
+  curl -sf -u "admin:$SONAR_PW" -X POST "$SONAR/api/webhooks/create" \
+    --data-urlencode name=jenkins \
+    --data-urlencode url=http://host.docker.internal:8080/sonarqube-webhook/ >/dev/null
+  echo "SonarQube: webhook to Jenkins created"
+fi
+
+# ---------- Jenkins admin password (reused across rebuilds) ----------
+JENKINS_PW=$(get_param /cicd/jenkins-admin-password || true)
+if [ -z "$JENKINS_PW" ]; then
+  JENKINS_PW=$(openssl rand -base64 24 | tr -d '/+=')
+  put_param /cicd/jenkins-admin-password "$JENKINS_PW"
+  echo "Jenkins: admin password generated and stored in Parameter Store"
+fi
+
+# ---------- GitHub deploy token (created by the user in Parameter Store) ----------
+GITHUB_TOKEN=$(get_param /cicd/github-deploy-token || true)
+if [ -z "$GITHUB_TOKEN" ]; then
+  echo "WARNING: /cicd/github-deploy-token not found - the 'Update Deployment Repo' stage will fail"
+  GITHUB_TOKEN="MISSING"
+fi
+
+# ---------- JCasC secret files ----------
+SECRETS_DIR=/var/lib/jenkins/casc-secrets
+install -d -m 0700 -o jenkins -g jenkins "$SECRETS_DIR"
+write_secret() { ( umask 077; printf '%s' "$2" > "$SECRETS_DIR/$1" ); chown jenkins:jenkins "$SECRETS_DIR/$1"; }
+write_secret JENKINS_ADMIN_PASSWORD "$JENKINS_PW"
+write_secret SONAR_TOKEN "$SONAR_TOKEN"
+write_secret GITHUB_DEPLOY_TOKEN "$GITHUB_TOKEN"
+write_secret JENKINS_URL "http://${PUBLIC_IP}:8080/"
+unset SONAR_PW SONAR_TOKEN JENKINS_PW GITHUB_TOKEN
+set -x
+# ======================= end of secrets section =======================
+
+# ---------- Jenkins plugins ----------
+curl -fsSL "https://github.com/jenkinsci/plugin-installation-manager-tool/releases/download/${PLUGIN_MANAGER_VERSION}/jenkins-plugin-manager-${PLUGIN_MANAGER_VERSION}.jar" \
+  -o /opt/jenkins-plugin-manager.jar
+install -d -o jenkins -g jenkins /var/lib/jenkins/plugins
+# shellcheck disable=SC2086
+java -jar /opt/jenkins-plugin-manager.jar --war /usr/share/java/jenkins.war \
+  --plugin-download-directory /var/lib/jenkins/plugins --plugins $JENKINS_PLUGINS
+chown -R jenkins:jenkins /var/lib/jenkins/plugins
+
+# ---------- JCasC file (injected by Terraform from devops/jenkins/casc.yaml) ----------
+echo "__CASC_B64__" | base64 -d > /var/lib/jenkins/casc.yaml
+chown jenkins:jenkins /var/lib/jenkins/casc.yaml
+
+# ---------- Jenkins service: no setup wizard, load JCasC ----------
+install -d /etc/systemd/system/jenkins.service.d
+cat > /etc/systemd/system/jenkins.service.d/override.conf <<'EOF'
+[Service]
+Environment="JAVA_OPTS=-Djava.awt.headless=true -Djenkins.install.runSetupWizard=false"
+Environment="CASC_JENKINS_CONFIG=/var/lib/jenkins/casc.yaml"
+Environment="SECRETS=/var/lib/jenkins/casc-secrets"
+EOF
+
+# ---------- helper scripts (run via SSM; they read the password on the server) ----------
+cat > /usr/local/bin/cicd-jenkins-api <<'EOF'
+#!/bin/bash
+# Usage: cicd-jenkins-api GET|POST <path>   e.g. cicd-jenkins-api POST /job/cicd-app/build
+set -euo pipefail
+PW=$(cat /var/lib/jenkins/casc-secrets/JENKINS_ADMIN_PASSWORD)
+J=http://localhost:8080
+JAR=$(mktemp); trap 'rm -f "$JAR"' EXIT
+CRUMB=$(curl -sf -c "$JAR" -u "admin:$PW" "$J/crumbIssuer/api/json" | jq -r '.crumbRequestField + ":" + .crumb')
+curl -sS -b "$JAR" -u "admin:$PW" -H "$CRUMB" -X "$1" "$J$2"
+EOF
+chmod 0700 /usr/local/bin/cicd-jenkins-api
+
+# ---------- start Jenkins ----------
+systemctl daemon-reload
 systemctl enable jenkins
 systemctl restart jenkins
+for _ in $(seq 1 60); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/login)" = "200" ] && break
+  sleep 5
+done
 
 # ---------- summary ----------
 {

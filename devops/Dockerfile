@@ -15,6 +15,12 @@ LABEL org.opencontainers.image.source="https://github.com/aravindrajsaravanan/ci
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# Security patch: CVE-2026-109518 (apt 3.0.3, HIGH). Upgrade only the affected packages
+# until the official python image ships apt >= 3.0.4. Remove this line once it does.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends --only-upgrade apt libapt-pkg7.0 \
+ && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid 10001 app \
  && useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
 
