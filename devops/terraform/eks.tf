@@ -40,6 +40,29 @@ resource "aws_eks_cluster" "main" {
   depends_on = [aws_iam_role_policy_attachment.eks_cluster]
 }
 
+# ---------- Console viewers ----------
+# Lets these identities see pods/nodes in the AWS console (read-only, whole cluster).
+# Changes still go through Git + Argo CD.
+resource "aws_eks_access_entry" "console_viewer" {
+  for_each = toset(local.console_viewer_arns)
+
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = each.value
+  type          = "STANDARD"
+}
+
+resource "aws_eks_access_policy_association" "console_viewer" {
+  for_each = aws_eks_access_entry.console_viewer
+
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = each.value.principal_arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminViewPolicy"
+
+  access_scope {
+    type = "cluster"
+  }
+}
+
 # ---------- Node role ----------
 data "aws_iam_policy_document" "ec2_assume" {
   statement {

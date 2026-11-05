@@ -38,6 +38,18 @@ variable "admin_cidr" {
   }
 }
 
+variable "console_viewer_include_root" {
+  description = "Give the AWS account root user read-only view of the cluster (pods/nodes in the console)."
+  type        = bool
+  default     = true
+}
+
+variable "console_viewer_arns" {
+  description = "Extra IAM user/role ARNs that get read-only view of the cluster in the AWS console."
+  type        = list(string)
+  default     = []
+}
+
 variable "vpc_cidr" {
   description = "CIDR block for the VPC."
   type        = string
