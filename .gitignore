@@ -23,7 +23,7 @@ crash.log
 *.auto.tfvars
 
 # Old local-only files (replaced by devops/)
-jenkins/
+/jenkins/
 
 # Env / secrets
 .env

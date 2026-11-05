@@ -1,0 +1,65 @@
+# Jenkins Configuration as Code (JCasC).
+# ${VARS} are read from files in /var/lib/jenkins/casc-secrets/ (created by jenkins-setup.sh,
+# values come from AWS Parameter Store or are generated on the server). No secrets in Git.
+jenkins:
+  systemMessage: "cicd-app Jenkins - configured as code (devops/jenkins/casc.yaml)"
+  numExecutors: 2
+  mode: NORMAL
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          name: admin
+          password: ${JENKINS_ADMIN_PASSWORD}
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+security:
+  globalJobDslSecurityConfiguration:
+    useScriptSecurity: false
+
+unclassified:
+  location:
+    url: ${JENKINS_URL}
+  sonarGlobalConfiguration:
+    buildWrapperEnabled: false
+    installations:
+      - name: sonarqube
+        serverUrl: http://localhost:9000
+        credentialsId: sonar-token
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: sonar-token
+              description: SonarQube global analysis token
+              secret: ${SONAR_TOKEN}
+          - usernamePassword:
+              scope: GLOBAL
+              id: github-deploy-token
+              description: GitHub fine-grained token - push to cicdpipeline_deployment
+              username: aravindrajsaravanan
+              password: ${GITHUB_DEPLOY_TOKEN}
+
+jobs:
+  - script: >
+      pipelineJob('cicd-app') {
+        description('Build, scan and publish cicd-app. Deploys via Argo CD (GitOps).')
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote { url('https://github.com/aravindrajsaravanan/cicdpipeline_project.git') }
+                branch('*/main')
+              }
+            }
+            scriptPath('devops/Jenkinsfile')
+            lightweight(true)
+          }
+        }
+      }
